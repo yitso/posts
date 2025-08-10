@@ -1,0 +1,26 @@
+---
+title: Demystifying Kubernetes Scheduler — Part 1: The Main Scheduling Loop
+date: 2025-08-10
+summary: The Kubernetes Scheduler is a critical brain in the cluster, responsible for placing every Pod onto a suitable node. While official documentation provides a solid foundation, it rarely ventures into the intricate technical details of how the scheduler actually operates under the hood. This series is my attempt to demystify that process. In this first part, we will peel back the layers to explore the scheduler's its core control loop, which are fundamental to understanding how it handles everything from new Pods to failures and retries.
+---
+
+The Kubernetes Scheduler is a critical brain in the cluster, responsible for placing every Pod onto a suitable node. While official documentation provides a solid foundation, it rarely ventures into the intricate technical details of how the scheduler actually operates under the hood. This series is my attempt to demystify that process. In this first part, we will peel back the layers to explore the scheduler's its core control loop, which are fundamental to understanding how it handles everything from new Pods to failures and retries.
+
+## Scheduler’s Main Scheduling Loop: `scheduleOne`
+
+At the heart of the Kubernetes scheduler is a control loop that continuously pulls Pods from an internal queue and attempts to assign each to a suitable Node. The scheduler typically runs as a single controller process (though it can be configured for parallel scheduling). Its main loop is implemented in the `scheduleOne` function, which is invoked repeatedly (potentially by multiple goroutines if parallelism is enabled).Each iteration of `scheduleOne` does the following:
+
+1. **Fetch the next pending Pod***: It calls `sched.NextPod()` to retrieve the highest-priority Pod from the scheduling queue. This call will block until a Pod is available for scheduling, avoiding busy-waiting on an empty queue. (The scheduler’s queue uses an informer to watch new Pods; when a Pod becomes schedulable, it’s added to the queue, unblocking NextPod.)
+
+2. **Skip or proceed based on Pod state**: If the Pod was deleted or already scheduled by another scheduler, the loop may skip scheduling it.
+
+3. **Run the scheduling cycle**: For a Pod that needs scheduling, the scheduler enters the **Scheduling Cycle**. This involves invoking the configured scheduling plugins in order (`PreFilter`, `Filter`, `PostFilter`, etc.) to determine a fit for the Pod. Essentially, the scheduler filters out nodes that don’t meet the Pod’s requirements (e.g. insufficient resources, missing labels, taints/tolerations) and then ranks the feasible nodes by scoring plugins. This process is synchronous per Pod – by design only one Pod at a time goes through **filtering** + **scoring** in a given scheduling thread. If a suitable node is found, the scheduler will reserve the Pod to that node (an **Assume** operation in cache) and prepare for binding. If no node is found, the scheduling fails for now (we’ll discuss how that Pod is requeued shortly).
+
+4. **Launch the binding cycle**: After a successful scheduling decision, the scheduler triggers an asynchronous Binding Cycle. It spawns a goroutine to perform the binding, which updates the Kubernetes API to assign the Pod to the chosen Node. This asynchronous step allows the main scheduling loop to quickly move on to schedule other Pods without waiting for network/API latency. The binding cycle will confirm the assignment (and emit a “Scheduled” event) or handle errors (e.g. if the API call fails). Notably, the scheduler increments metrics to track active binding goroutines when it launches this async process (the scheduler_goroutines metric labeled "binding" counts how many binding operations are in flight).
+
+5. **Handle scheduling failure**: If the scheduling cycle could not find any suitable node (or if some error occurred), the scheduler invokes its failure handler logic. This records a FailedScheduling event for the Pod and requeues the Pod internally for a later attempt. Crucially, the Pod is not retried in a tight loop; instead, it’s placed into a specific holding queue (unschedulable/backoff, discussed below) so that other pending Pods can be scheduled and this Pod will be retried after some conditions change or a backoff period expires.
+
+
+**Parallelism**: By default, the scheduler is actually capable of processing up to 16 Pods in parallel (parallel scheduling threads). This means the main scheduling loop can run concurrently in multiple goroutines, each pulling from the queue and scheduling different Pods. This parallelism can improve throughput on large clusters, but even with parallelism, each Pod’s scheduling cycle is serialized on a per-Pod basis (and if two Pods contend for the same Node, Kubernetes’ optimistic concurrency via the API server will handle conflicts). In practice, enabling parallelism means up to 16 Pods may be in the scheduling phase at once, while multiple others could be in binding phase concurrently. The scheduler’s design (with thread-safe priority queue and caching) allows this concurrency. Metrics like `scheduler_goroutines` expose how many scheduling threads and binding threads are active, which can help tune performance.
+
+---
