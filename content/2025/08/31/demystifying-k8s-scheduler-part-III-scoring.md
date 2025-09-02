@@ -1,3 +1,9 @@
+---
+title: Demystifying Kubernetes Scheduler — Part III: Scoring Engine and Plugin Architecture
+date: 2025-08-31
+summary: Explore how Kubernetes scheduler evaluates feasible nodes through its scoring engine. Covers plugin architecture, weight systems, extension points, and performance optimization strategies. 
+---
+
 ## From Filtering to Scoring: Feasible Nodes
 
 In Kubernetes scheduling, once the **filtering** phase narrows the cluster down to a set of **feasible nodes** for a Pod, the scheduler enters the **scoring** phase. Scoring is applied only to those nodes that passed all filters. To reduce overhead in very large clusters, the scheduler may sample only a subset of nodes for both filtering and scoring, controlled by the `percentageOfNodesToScore` parameter.
@@ -6,9 +12,9 @@ The key distinction is that filtering answers *"Which nodes can run this Pod?"* 
 
 ## Score Plugin Architecture: Extension Points and Execution Flow
 
-**Score plugins** implement the `ScorePlugin` interface defined in (`pkg/scheduler/framework/interface.go`)[https://github.com/kubernetes/kubernetes/blob/v1.33.4/pkg/scheduler/framework/interface.go#L607] and execute through a structured multi-phase process. Scoring expresses *preferences*, not hard requirements. A node with a low score remains eligible as long as it passed filtering. If filtering produces no feasible nodes, the scheduler cannot proceed to scoring and instead invokes the **PostFilter** extension point, which may include preemption strategies.
+**Score plugins** implement the `ScorePlugin` interface(defined in [`pkg/scheduler/framework/interface.go`](https://github.com/kubernetes/kubernetes/blob/v1.33.4/pkg/scheduler/framework/interface.go#L607)) and execute through a structured multi-phase process. Scoring expresses *preferences*, not hard requirements. A node with a low score remains eligible as long as it passed filtering. If filtering produces no feasible nodes, the scheduler cannot proceed to scoring and instead invokes the **PostFilter** extension point, which may include preemption strategies.
 
-### PreScore Extension Point
+### PreScore
 
 Before per-node evaluation begins, plugins may implement an optional **PreScore** hook. This phase runs once per scheduling cycle to prepare shared data structures, avoiding expensive recomputation for each node:
 
@@ -18,25 +24,40 @@ Before per-node evaluation begins, plugins may implement an optional **PreScore*
 
 PreScore failure aborts the scheduling cycle for that Pod.
 
-### Score Extension Point
+### Score
 
 Each plugin's `Score()` method evaluates every feasible node in parallel (bounded by internal worker pools). **Plugins return integer scores within the range `[0, MaxNodeScore]` (typically 0–100)**, representing how well each node satisfies the plugin's specific preference.
 
-### NormalizeScore Extension Point
+### NormalizeScore
 
 Plugins may optionally implement `NormalizeScore()` to adjust raw scores across all nodes in the cycle. **This method must return values within `[0, MaxNodeScore]` or the scheduler will abort with an error**. This phase handles scaling, inversion, or normalization relative to min/max values to ensure score comparability across different plugins.
 
-### Final Aggregation
+### Final Aggregation and Weight System
 
-The scheduler applies configured plugin weights and computes the final score through weighted summation:
+The scheduler combines individual plugin scores through a weighted summation mechanism. Each plugin has a configured weight that acts as a multiplier for its score contribution:
 
-```
+```go
 for _, plugin := range plugins {
     nodeScore[node] += plugin.Score(node) * plugin.Weight
 }
 ```
 
-Plugin normalized scores respect the MaxNodeScore constraint, but total sums are unbounded. The node with the highest weighted total is selected, with random tie-breaking for identical scores.
+**Default weight configuration** (from `pkg/scheduler/framework/plugins/*/defaults.go`):
+
+- `TaintToleration`: 3 (strongly penalizes tainted nodes)
+- `InterPodAffinity`: 2
+- `NodeResourcesLeastAllocated`: 1
+- `NodeResourcesBalancedAllocation`: 1
+- `NodeAffinity`: 1
+- `ImageLocality`: 1
+
+**Weight behavior characteristics:**
+
+- **Linear scaling**: Weights multiply plugin scores directly without normalization across plugins
+- **Unbounded totals**: While individual plugin scores respect MaxNodeScore, final sums can exceed this limit
+- **Dominance effects**: Extremely high weights can override all other considerations, effectively turning preferences into requirements
+
+The node with the highest weighted total is selected, with random tie-breaking for identical scores.
 
 ## Score Plugin Examples
 
@@ -62,25 +83,6 @@ Processes `preferredDuringSchedulingIgnoredDuringExecution` rules, accumulating 
 ### ImageLocality
 
 Scores nodes based on cached image bytes, reducing container startup latency. Default weight configuration minimizes impact, but can reinforce scheduling patterns for image-heavy workloads.
-
-## Weight Configuration and Score Combination
-
-With individual plugin behaviors in mind, the next step is to understand how their outputs are aggregated into a single decision.
-
-**Default plugin weights** (defined in `pkg/scheduler/framework/plugins/*/defaults.go`):
-
-- `TaintToleration`: 3 (strongly penalize tainted nodes)
-- `InterPodAffinity`: 2
-- `NodeResourcesLeastAllocated`: 1
-- `NodeResourcesBalancedAllocation`: 1
-- `NodeAffinity`: 1
-- `ImageLocality`: 1
-
-**Weight behavior characteristics:**
-
-- Zero weight disables plugin influence entirely
-- **Weights operate as linear multipliers with extreme values effectively overriding all other considerations**
-- No cross-plugin normalization occurs — raw weighted sum determines final ranking
 
 ## Tie-Breaking Mechanism
 
@@ -146,79 +148,56 @@ Since Kubernetes 1.19, the **Scheduling Framework** provides a first-class exten
 
 ## Performance Considerations and Observability
 
-Scheduling performance often becomes a limiting factor in very large clusters. The scoring stage in particular can dominate CPU time when many nodes are feasible and multiple heavy plugins are enabled.
+In very large clusters, the **scoring stage** often dominates scheduling latency. While the exact cost depends on workload and configuration, Kubernetes documentation and practitioner reports consistently highlight several recurring bottlenecks.
 
-### Complexity and Hot Paths
+### Typical Performance Bottlenecks
 
-**Time complexity:** Roughly `O(feasibleNodes × enabledScorePlugins)`. For a 5,000-node cluster with 10 active scoring plugins, that represents 50,000 scoring calls per Pod.
+- **Inter-Pod Affinity / Anti-Affinity**
+   The Kubernetes documentation explicitly warns that affinity and anti-affinity rules *“significantly slow down scheduling in large clusters”* and should be used with caution beyond a few hundred nodes. This makes affinity one of the most common hot spots in production.
+- **Complex Affinity Rules**
+   Industry guidance also notes that *“complex affinity settings can impact scheduler performance and may lead to resource fragmentation”*, confirming both performance and efficiency trade-offs.
+- **Sampling Mechanism**
+   Kubernetes provides the `percentageOfNodesToScore` parameter to reduce scoring overhead. By limiting the number of nodes considered in the scoring stage, scheduling time can be reduced without materially affecting placement quality. This mechanism exists precisely to mitigate the CPU and latency pressure from large feasible node sets.
 
-**Memory pressure:** Some plugins (e.g., InterPodAffinity, PodTopologySpread) maintain global maps of pod distribution; their PreScore step may consume significant memory as cluster size grows.
+### Observability: How to Detect Bottlenecks
 
-**Cache efficiency:** Plugins that repeatedly traverse node/pod objects without caching can trigger high GC pressure in Go runtime, particularly with naive custom plugin implementations.
+Even without precise percentage breakdowns, Kubernetes offers built-in observability hooks:
 
-### Common Bottlenecks
+**Prometheus Metrics**
 
-**InterPodAffinity / Anti-affinity:** Requires scanning many existing Pods across nodes or zones. In clusters with tens of thousands of Pods, this becomes one of the heaviest plugins by execution time.
+- `scheduler_plugin_execution_duration_seconds`: Measures per-plugin execution latency.
+- `scheduler_framework_extension_point_duration_seconds`: Captures time spent in each extension point (PreScore, Score, NormalizeScore).
 
-**Custom ScorePlugins:** Plugins that query external APIs or perform complex computations (e.g., GPU bin-packing with NUMA awareness) can add milliseconds per node, which scales poorly across large feasible sets.
+**Verbose Logging**
 
-**Large feasible sets:** In permissive clusters with few active filters, almost every node becomes feasible, causing scoring to dominate the scheduling cycle duration.
+- `--v=10`: Logs per-plugin, per-node scores — useful for debugging placement.
+- `--v=5+`: Logs overall duration of each scheduling phase, useful for performance profiling.
 
-### Observability and Debugging
+**Configuration Knobs**
+Adjusting `percentageOfNodesToScore` and comparing scheduling latency before/after provides a direct way to validate performance improvements.
 
-**Verbose logs:** Running the scheduler with `--v=10` shows per-plugin scores for each node. This is the primary tool for debugging placement decisions.
+### Optimization Approaches (Backed by Guidance)
 
-**Trace logging:** With `--v=5+`, timing information for each scheduling phase becomes visible in logs.
-
-**Prometheus metrics:**
-
-- `scheduler_plugin_execution_duration_seconds` — per-plugin timing, broken down by extension point
-- `scheduler_scheduling_duration_seconds` — end-to-end scheduling latency distribution
-- `scheduler_pending_pods` — backlog of unscheduled Pods, an indirect signal of scheduler saturation
-
-**Offline simulation:** The `scheduler-plugins/simulator` project allows replaying real workloads with modified plugin sets or weights without impacting production clusters.
-
-### Mitigation Strategies
-
-**Tune sampling:** Adjust `percentageOfNodesToScore` (default 50%). In large homogeneous clusters, lowering this to 10–20% reduces scheduling CPU usage drastically with minimal impact on placement quality.
-
-**Prune plugin set:** Disable unused scoring plugins in scheduler profiles. Every plugin adds computational cost even if its influence on final decisions is marginal.
-
-**Optimize heavy plugins:**
-
-- For InterPodAffinity, restrict label scopes and namespaces to reduce the number of Pods requiring evaluation
-- For topology spread, scope constraints to zones instead of nodes when placement requirements permit
-- For custom plugins, avoid synchronous network calls and pre-cache static data
-
-**Run multiple schedulers:** In extreme-scale clusters, deploy multiple scheduler instances with disjoint responsibilities (e.g., critical workloads vs. batch jobs) to reduce contention on individual scheduler threads.
-
-### Practical Example
-
-In a 3,000-node cluster:
-
-- With default settings (10 plugins, `percentageOfNodesToScore=50%`), average scheduling latency measured ~150ms per Pod
-- Reducing `percentageOfNodesToScore` to 20% and disabling `ImageLocality` reduced latency to ~60ms
-- Scoping `InterPodAffinity` to namespace-level only provided an additional 25% latency reduction with negligible change in placement quality
-
-## Common Pitfalls and Anti-Patterns
-
-Armed with performance insights and observability tools, let's examine common pitfalls engineers encounter when tuning scoring:
-
-**Overweighted Anti-Affinity** Setting `preferredDuringScheduling` weights to 100 does not guarantee spreading. High weights distort scoring behavior and degrade `InterPodAffinity` performance. Use **PodTopologySpread** or required anti-affinity for strict distribution requirements.
-
-**Extreme Plugin Weights** Weights significantly larger than others create effective overrides. Reserve for genuine hard preferences such as regulatory compliance requirements.
-
-**Misclassifying Requirements vs Preferences** Mandatory placement constraints belong in **filters** (nodeSelector, required affinity, taints), not high-weight scoring preferences.
-
-**Performance Neglect** Each enabled plugin executes per feasible node. Monitor plugin execution metrics and disable unused plugins. Anti-affinity and scheduler extenders impose the highest computational overhead.
+- **Limit Affinity Usage**: Avoid affinity/anti-affinity unless strictly necessary, especially in clusters with hundreds or thousands of nodes.
+- **Reduce Sampling Percentage**: Tune `percentageOfNodesToScore` to lower scheduling CPU cost, while observing metrics to validate placement quality.
+- **Rely on Metrics and Logs**: Use Prometheus and verbose logs to identify the dominant plugin(s) causing latency.
+- **Offline Simulation**: Community tools such as `scheduler-plugins/simulator` allow replaying workloads with different plugin sets in a safe environment.
 
 ## In the End
 
-Scoring in Kubernetes is straightforward in code — *per-node plugin scores, weighted sum, random tie-break*. But the engineering consequences are subtle:
+Scoring in Kubernetes is straightforward in code — *per-node plugin scores, weighted sum, random tie-break*. But the engineering consequences are subtle.
 
-- **Weights** are powerful levers; misuse (e.g. overweight anti-affinity) often hurts efficiency
-- **Tie-breaking** is intentionally random, so don't expect deterministic placement when scores tie
-- **Extensibility** is best done with framework plugins; extenders are legacy and add latency
-- **Performance** matters: every plugin runs on every feasible node; watch logs and metrics to keep scheduling fast
+What makes it challenging is not the math but the **engineering trade-offs**: how weights shift placement priorities, how tie-breaking adds randomness, and how every enabled plugin increases scheduling cost.
 
-The takeaway for engineers: don't treat scores as black magic. Understand the mechanics well enough to predict outcomes, use observability to validate assumptions, and only adjust weights or add plugins when you know the trade-offs. With that foundation, you can reason about placement decisions and even extend the scheduler to encode your own business logic.
+By understanding these mechanics and using the available observability tools, engineers can predict placement outcomes, validate them in production, and extend the scheduler with confidence.
+
+## Reference
+
+[1] Kubernetes Contributors. *Assigning Pods to Nodes: Affinity and Anti-Affinity*. Kubernetes Documentation.
+ https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+
+[2] CloudBolt Software. *Kubernetes Pod Scheduling: Affinity, Node Selectors, and Taints Explained*. CloudBolt Blog.
+ https://www.cloudbolt.io/kubernetes-pod-scheduling/kubernetes-affinity/
+
+[3] Kubernetes Contributors. *Scheduler Performance Tuning*. Kubernetes Documentation.
+ https://kubernetes.io/docs/concepts/scheduling-eviction/scheduler-perf-tuning/
