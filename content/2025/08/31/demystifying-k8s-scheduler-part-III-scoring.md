@@ -1,5 +1,5 @@
 ---
-id: kubernetes-scheduler-scoring
+id: 2025-08-31-kubernetes-scheduler-scoring
 title: "Demystifying Kubernetes Scheduler — Part III: Scoring Engine and Plugin Architecture"
 date: 2025-08-31
 summary: Explore how Kubernetes scheduler evaluates feasible nodes through its scoring engine. Covers plugin architecture, weight systems, extension points, and performance optimization strategies. 
