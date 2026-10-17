@@ -1,0 +1,38 @@
+{
+  "lang": "en",
+  "date_locale": "en",
+  "i18n_file": "i18n/en.json",
+  "posts": "content",
+  "base_url": "https://yitso.github.io/posts",
+  "theme": {
+    "id": "default"
+  },
+  "site": {
+    "title": "Yitso’s Posts",
+    "nav": "Yitso",
+    "icon": "/static/itso/icons/isto-favicon.ico"
+  },
+  "profile": {
+    "enabled": false
+  },
+  "announcement": {
+    "enabled": false
+  },
+  "footer": {
+    "enabled": true,
+    "copyright": {
+      "enabled": true,
+      "owner_name": "Yitso",
+      "url": "https://github.com/yitso/posts",
+      "notice": {
+        "mode": "license",
+        "license": {
+          "prefix": "Licensed under ",
+          "name": "CC BY-NC 4.0",
+          "url": "https://creativecommons.org/licenses/by-nc/4.0/"
+        },
+        "separator": "·"
+      }
+    }
+  }
+}
