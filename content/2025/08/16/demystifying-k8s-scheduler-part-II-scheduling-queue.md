@@ -1,5 +1,6 @@
 ---
-title: Demystifying Kubernetes Scheduler — Part II: Scheduling Queue
+id: 2025-08-16-kubernetes-scheduler-scheduling-queue
+title: "Demystifying Kubernetes Scheduler — Part II: Scheduling Queue"
 date: 2025-08-16
 summary: Let’s explore the inner workings of Kubernetes’s Scheduling Queue — from ActiveQ to BackoffQ to UnschedulablePods — and see how its design keeps scheduling efficient and resilient.
 ---

@@ -1,5 +1,6 @@
 ---
-title: Demystifying Kubernetes Scheduler — Part I: The Main Scheduling Loop
+id: 2025-08-10-kubernetes-scheduler-main-loop
+title: "Demystifying Kubernetes Scheduler — Part I: The Main Scheduling Loop"
 date: 2025-08-10
 summary: The Kubernetes Scheduler decides where every Pod will run, but the inner workings are often hidden from view. I’ll break down how the scheduler selects nodes, handles failures, and retries scheduling, providing a clear view of this critical component in action.
 ---
